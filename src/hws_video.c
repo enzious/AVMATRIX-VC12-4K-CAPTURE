@@ -418,6 +418,20 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	//printk( "%s()\n", __func__);
+
+	// Prevent format changes while streaming is active
+	// This protects against corruption when apps try to change format while others are capturing
+	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
+	if(videodev->startstreamIndex > 0)
+	{
+		// Streaming is active - format is locked
+		// Return current format instead of changing it
+		spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+		//printk("%s: Format locked while streaming (startstreamIndex=%d)\n", __func__, videodev->startstreamIndex);
+		return hws_vidioc_g_fmt_vid_cap(file, priv, f);
+	}
+	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+
 	nVideoFmtIndex = v4l2_get_suport_VideoFormatIndex(f);
 	if(nVideoFmtIndex ==-1) return -EINVAL;
 
@@ -605,7 +619,16 @@ static int hws_open(struct file *file)
 	//v4l2_model_timing_t *p_SupportmodeTiming;
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
+	int ret;
 	//printk( "%s(ch-%d)->%d\n", __func__,videodev->index,videodev->fileindex);
+
+	// Initialize V4L2 file handle for proper V4L2 infrastructure
+	ret = v4l2_fh_open(file);
+	if (ret) {
+		// v4l2_fh_open failed, no cleanup needed
+		return ret;
+	}
+
 	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 	videodev->fileindex ++;
 	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
@@ -618,29 +641,35 @@ static int hws_release(struct file *file)
 	struct hws_video *videodev = video_drvdata(file);
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
+	int last_close = 0;
 	//printk( "%s(ch-%d)->%d\n", __func__,videodev->index,videodev->fileindex);
+
+	// Decrement file handle count
 	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 	if(videodev->fileindex>0)
 	{
 		videodev->fileindex --;
 	}
+	last_close = (videodev->fileindex == 0);
 	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 	//printk( "%s(ch-%d)->%d done\n", __func__,videodev->index,videodev->fileindex);
 
-	if(videodev->fileindex==0)
+	// vb2_fop_release will handle stopping the stream if this handle was streaming
+	// This calls hws_stop_streaming which decrements startstreamIndex
+	_vb2_fop_release(file, NULL);
+
+	// Emergency cleanup: If this was the last app and hardware is somehow still running
+	// (e.g., app crashed before calling STREAMOFF, or reference count got out of sync)
+	if(last_close && videodev->startstreamIndex > 0)
 	{
-		if(videodev->startstreamIndex >0)
-		{
-			//printk( "StopVideoCapture %s(%d)->%d [%d]\n", __func__,videodev->index,videodev->fileindex,videodev->startstreamIndex);
+		//printk( "Emergency cleanup: StopVideoCapture %s(%d)->%d [%d]\n", __func__,videodev->index,videodev->fileindex,videodev->startstreamIndex);
+		spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 			StopVideoCapture(videodev->dev,videodev->index);
-			videodev->startstreamIndex =0;
-		}
-		return(vb2_fop_release(file));
+		videodev->startstreamIndex = 0;
+		spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 	}
-	else
-	{
-		return 0;
-	}
+
+	return 0;
 
 }
 
@@ -1296,11 +1325,6 @@ static int hws_queue_setup(struct vb2_queue *q,
 	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 	size = 2* videodev->current_out_width * videodev->curren_out_height; // 16bit
 	//printk( "%s(%d)->%d[%d?=%d]\n", __func__,videodev->index,videodev->fileindex,sizes[0],size);
-	if(videodev->fileindex >1)
-	{
-		spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
-		return -EINVAL;
-	}
 	//printk( "q->num_buffers = %d *num_buffers =%d \n", q->num_buffers,*num_buffers);
 	//if (tot_bufs < 2)
 	//	tot_bufs = 2;
@@ -1383,35 +1407,31 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	//printk( "%s(%d)->%d\n", __func__,videodev->index,videodev->fileindex);
-	#if 0
-	if(videodev->fileindex >1)
-	{
-	return -EINVAL;
-}
-#endif
-videodev->seqnr = 0;
-mdelay(100);
-//---------------
-//if(videodev->fileindex==1)
-//{
-//printk( "StartVideoCapture %s(%d)->%d\n", __func__,videodev->index,videodev->fileindex);
-StartVideoCapture(videodev->dev,videodev->index);
-videodev->startstreamIndex++;
-//------------------------ reset queue
-//printk( "%s(%d)->%d  reset queue \n", __func__,videodev->index,videodev->fileindex);
+	videodev->seqnr = 0;
+	mdelay(100);
+	//---------------
+	// Increment stream reference count with lock protection
+	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
+	//printk( "StartVideoCapture %s(%d)->%d [refcnt=%d]\n", __func__,videodev->index,videodev->fileindex,videodev->startstreamIndex);
+	StartVideoCapture(videodev->dev,videodev->index);
+	// Note: StartVideoCapture returns -1 if already started, but that's OK
+	// We still increment our reference count
+	videodev->startstreamIndex++;
+	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+	//------------------------ reset queue
+	//printk( "%s(%d)->%d  reset queue \n", __func__,videodev->index,videodev->fileindex);
 
-//}
-spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
-while (!list_empty(&videodev->queue)) {
-	struct hwsvideo_buffer *buf = list_entry(videodev->queue.next,
-											 struct hwsvideo_buffer, queue);
-	list_del(&buf->queue);
+	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
+	while (!list_empty(&videodev->queue)) {
+		struct hwsvideo_buffer *buf = list_entry(videodev->queue.next,
+												 struct hwsvideo_buffer, queue);
+		list_del(&buf->queue);
 
-	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-}
-spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
-//-----------------------
-return 0;
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+	//-----------------------
+	return 0;
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)
@@ -1419,20 +1439,20 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	struct hws_video *videodev = q->drv_priv;
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
+	int should_stop_hw;
 	//printk( "%s(%d)->%d\n", __func__,videodev->index,videodev->fileindex);
 
-	//if(videodev->seqnr){
-	//vb2_wait_for_all_buffers(q);
-	//	mdelay(100);
-	//printk( "%s() vb2_wait_for_all_buffers\n", __func__);
-	//}
-	#if 1
-	//-----------------------------------
+	// Decrement stream reference count with lock protection
+	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 	videodev->startstreamIndex --;
 	if(videodev->startstreamIndex<0) videodev->startstreamIndex=0;
-	if(videodev->startstreamIndex == 0)
+	should_stop_hw = (videodev->startstreamIndex == 0);
+	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+
+	//printk( "StopVideoCapture %s(%d)->%d [refcnt=%d]\n", __func__,videodev->index,videodev->fileindex,videodev->startstreamIndex);
+	// Only stop hardware capture when last stream stops
+	if(should_stop_hw)
 	{
-		//printk( "StopVideoCapture %s(%d)->%d [%d]\n", __func__,videodev->index,videodev->fileindex,videodev->startstreamIndex);
 		StopVideoCapture(videodev->dev,videodev->index);
 	}
 	//------------------
@@ -1445,7 +1465,6 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 	//-----------------------------------------------------------------
-	#endif
 
 }
 
